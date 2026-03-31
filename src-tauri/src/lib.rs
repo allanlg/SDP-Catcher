@@ -137,7 +137,12 @@ fn start_sniffing(app: AppHandle, selected_interfaces: Vec<NetworkInterface>, st
         thread::spawn(move || {
             let mut mdns_cache: HashMap<String, String> = HashMap::new();
             let mut target_npf_name = String::new();
-            let mdns_sender = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+            let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+            let addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+            let _ = socket.bind(&addr.into());
+            let target_ipv4: Ipv4Addr = target_ip.parse().unwrap_or(Ipv4Addr::new(0, 0, 0, 0));
+            let _ = socket.set_multicast_if_v4(&target_ipv4);
+            let mdns_sender: std::net::UdpSocket = socket.into();
 
             let send_mdns_query = |ip: &str, sender: &std::net::UdpSocket| {
                 let parts: Vec<&str> = ip.split('.').collect();
@@ -189,7 +194,18 @@ fn start_sniffing(app: AppHandle, selected_interfaces: Vec<NetworkInterface>, st
                 .open()
                 .expect("Erreur fatale lors de l'ouverture du handle pcap");
 
+            let mut arp_cache: HashMap<String, String> = HashMap::new();
+            let mut mdns_cooldown: HashMap<String, std::time::Instant> = HashMap::new();
+            let mut last_memory_cleanup = std::time::Instant::now();
+
             while !stop_flag_node.load(Ordering::Relaxed) {
+                if last_memory_cleanup.elapsed().as_secs() > 300 {
+                    mdns_cache.clear();
+                    arp_cache.clear();
+                    mdns_cooldown.clear();
+                    last_memory_cleanup = std::time::Instant::now();
+                }
+
                 match cap.next_packet() {
                     Ok(packet) => {
                         if let Some(eth) = EthernetPacket::new(packet.data) {
@@ -251,10 +267,18 @@ fn start_sniffing(app: AppHandle, selected_interfaces: Vec<NetworkInterface>, st
                                                     }
 
                                                     let best_name = if !stream_name.is_empty() && stream_name != "---" { stream_name } else { sap_name };
-                                                    let (mac, _oui) = get_mac_from_arp(&origin_ip);
+                                                    
+                                                    // 4A. CACHE ARP (Évite de spawner le process system 'arp' 1000 fois par seconde)
+                                                    let mac = if let Some(cached_mac) = arp_cache.get(&origin_ip) {
+                                                        cached_mac.clone()
+                                                    } else {
+                                                        let (resolved_mac, _) = get_mac_from_arp(&origin_ip);
+                                                        arp_cache.insert(origin_ip.clone(), resolved_mac.clone());
+                                                        resolved_mac
+                                                    };
+
                                                     let key = if mac != "Unknown" { mac.clone() } else { origin_ip.clone() };
 
-                                                    // Fallback propre
                                                     let mut mfr_enum = if !ptp_id_from_sdp.is_empty() { identify_manufacturer(&ptp_id_from_sdp) } else { manufacturer::Manufacturer::Unknown };
                                                     if mfr_enum == manufacturer::Manufacturer::Unknown { mfr_enum = identify_manufacturer(&mac); }
                                                     let fallback_name = format!("{} ({})", mfr_enum.to_string(), mac);
@@ -262,7 +286,9 @@ fn start_sniffing(app: AppHandle, selected_interfaces: Vec<NetworkInterface>, st
                                                     let mut is_new = false;
                                                     let final_device_name = {
                                                         let table = discovery_node.lock().unwrap();
-                                                        if !table.contains_key(&key) { is_new = true; }
+                                                        if !table.contains_key(&key) {
+                                                            is_new = true;
+                                                        }
                                                         if let Some(mdns_name) = mdns_cache.get(&origin_ip) {
                                                             mdns_name.clone()
                                                         } else {
@@ -270,8 +296,17 @@ fn start_sniffing(app: AppHandle, selected_interfaces: Vec<NetworkInterface>, st
                                                         }
                                                     };
 
+                                                    // 4B. RATE LIMITER mDNS (Empêche l'application de devenir un canon DoS)
                                                     if is_new && !mdns_cache.contains_key(&origin_ip) {
-                                                        send_mdns_query(&origin_ip, &mdns_sender);
+                                                        let can_send = match mdns_cooldown.get(&origin_ip) {
+                                                            Some(last_sent) => last_sent.elapsed().as_secs() > 30, // Cooldown de 30 secondes par IP
+                                                            None => true,
+                                                        };
+
+                                                        if can_send {
+                                                            send_mdns_query(&origin_ip, &mdns_sender);
+                                                            mdns_cooldown.insert(origin_ip.clone(), std::time::Instant::now());
+                                                        }
                                                     }
 
                                                     {

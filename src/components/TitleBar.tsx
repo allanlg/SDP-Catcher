@@ -33,7 +33,7 @@ export function TitleBar() {
       <div className="flex items-center gap-2.5 pointer-events-none relative z-20">
         <img src="/app-icon.png" className="w-6 h-6 object-contain" alt="SDP Catcher Logo" />
         <span className="text-[0.6875rem] font-bold text-zinc-500 tracking-[0.12em] uppercase">SDP Catcher</span>
-        <span className="text-[0.6rem] text-zinc-600 font-mono ml-1">v1.0.2-1</span>
+        <span className="text-[0.6rem] text-zinc-600 font-mono ml-1">v1.0.2-2 SECURITY</span>
       </div>
 
       <div className="flex items-center h-full relative z-20">
