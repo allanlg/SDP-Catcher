@@ -60,7 +60,7 @@ pub struct AppState {
     sniffer_stop_flag: Mutex<Option<Arc<AtomicBool>>>,
     default_unknown_timeout_s: Mutex<u64>,
     discovery_table: Arc<Mutex<HashMap<String, DeviceInfo>>>,
-    device_timeout_modes: Mutex<HashMap<String, bool>>,
+    device_timeout_modes: Arc<Mutex<HashMap<String, bool>>>,
 }
 
 
@@ -109,6 +109,7 @@ fn start_sniffing(app: AppHandle, selected_interfaces: Vec<NetworkInterface>, st
     for network_interface in &selected_interfaces {
         let stop_flag_node = Arc::clone(&stop_flag);
         let discovery_node = Arc::clone(&discovery_table_arc);
+        let device_timeout_modes_node = Arc::clone(&state.device_timeout_modes);
         let app_node = app.clone();
         let target_name = network_interface.name.clone();
         let target_ip = network_interface.ip.clone();
@@ -187,6 +188,9 @@ fn start_sniffing(app: AppHandle, selected_interfaces: Vec<NetworkInterface>, st
                     let mut table = discovery_node.lock().unwrap();
                     table.retain(|_, entry| entry.last_seen.elapsed().as_secs() < 900); // 15 minutes TTL
                     
+                    let mut modes = device_timeout_modes_node.lock().unwrap();
+                    modes.retain(|ip_key, _| table.values().any(|device| &device.ip == ip_key));
+
                     last_memory_cleanup = std::time::Instant::now();
                 }
 
@@ -230,6 +234,10 @@ fn start_sniffing(app: AppHandle, selected_interfaces: Vec<NetworkInterface>, st
                             } 
                             else if current_ethertype == EtherTypes::Ipv4 {
                                 if let Some(ipv4) = Ipv4Packet::new(current_payload) {
+                                    let origin_ipv4 = ipv4.get_source();
+                                    if origin_ipv4 == target_ipv4 {
+                                        continue; // BOUCLIER 1 : Anti-Echo (on ignore nos propres paquets)
+                                    }
                                     if ipv4.get_next_level_protocol() == IpNextHeaderProtocols::Udp {
                                         if let Some(udp) = UdpPacket::new(ipv4.payload()) {
                                             let dest_port = udp.get_destination();
@@ -242,7 +250,10 @@ fn start_sniffing(app: AppHandle, selected_interfaces: Vec<NetworkInterface>, st
                                                     let sdp_bytes = &sap_payload[pos..];
                                                     let sdp_content = String::from_utf8_lossy(sdp_bytes).to_string();
                                                     
-                                                    let mut origin_ip = ipv4.get_source().to_string();
+                                                    let mut origin_ip = origin_ipv4.to_string();
+                                                    if !origin_ipv4.is_private() && !origin_ipv4.is_link_local() {
+                                                        continue; // BOUCLIER 2 : On ignore le spoofing d'IP publiques
+                                                    }
                                                     let mut sap_name = "---".to_string();
                                                     let mut stream_name = "---".to_string();
                                                     let mut ptp_id_from_sdp = String::new();
@@ -298,6 +309,7 @@ fn start_sniffing(app: AppHandle, selected_interfaces: Vec<NetworkInterface>, st
                                                         };
 
                                                         if can_send && global_mdns_counter < 5 { // LIMITE GLOBALE : Max 5/sec
+                                                            if mdns_cooldown.len() > 2048 { mdns_cooldown.clear(); }
                                                             send_mdns_query(&origin_ip, &mdns_sender);
                                                             mdns_cooldown.insert(origin_ip.clone(), std::time::Instant::now());
                                                             global_mdns_counter += 1;
@@ -399,6 +411,7 @@ fn start_sniffing(app: AppHandle, selected_interfaces: Vec<NetworkInterface>, st
                                                         {
                                                             let mut table = discovery_node.lock().unwrap();
                                                             for (ip_str, clean_name) in new_cache_entries {
+                                                                if mdns_cache.len() > 2048 { mdns_cache.clear(); }
                                                                 mdns_cache.insert(ip_str.clone(), clean_name.clone());
                                                                 for (key, entry) in table.iter_mut() {
                                                                     if entry.ip == ip_str && entry.name != clean_name {
@@ -576,7 +589,7 @@ pub fn run() {
             sniffer_stop_flag: Mutex::new(None),
             default_unknown_timeout_s: Mutex::new(60),
             discovery_table: Arc::new(Mutex::new(HashMap::new())),
-            device_timeout_modes: Mutex::new(HashMap::new()),
+            device_timeout_modes: Arc::new(Mutex::new(HashMap::new())),
         })
         .invoke_handler(tauri::generate_handler![
             get_network_interfaces,
