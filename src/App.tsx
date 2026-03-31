@@ -32,6 +32,7 @@ export interface Device {
 
 interface SdpDiscoveredEvent {
   source_ip: string;
+  device_name: string;
   sdp_content: string;
   mac: string;
   manufacturer: string;
@@ -230,7 +231,7 @@ function App() {
 
   useEffect(() => {
     const unlistenSdp = listen<SdpDiscoveredEvent>("sdp-discovered", (event) => {
-      const { sdp_content, mac, manufacturer, sap_timeout_ms } = event.payload;
+      const { sdp_content, mac, manufacturer, sap_timeout_ms, device_name } = event.payload;
       const { name, multicastIp, originIp, sessionInfo } = parseSdp(sdp_content);
 
       if (originIp === "0.0.0.0") return;
@@ -238,7 +239,7 @@ function App() {
       setDevices((prev) => {
         const timestamp = Date.now();
         const existingDeviceIndex = prev.findIndex((d) => d.ip === originIp);
-        const deviceName = sessionInfo || `Device ${originIp}`;
+        const deviceName = (device_name && device_name !== "---") ? device_name : (sessionInfo || `Device ${originIp}`);
 
         if (existingDeviceIndex >= 0) {
           const newDevices = [...prev];
@@ -312,6 +313,16 @@ function App() {
       (event) => {
         const [key, info] = event.payload;
         setArpTable((prev) => ({ ...prev, [key]: info }));
+        
+        // Rafraîchissement live du nom dans l'interface
+        if (info.name && info.name !== "---") {
+          setDevices(prev => prev.map(d => {
+            if (d.ip === info.ip) {
+              return { ...d, name: info.name };
+            }
+            return d;
+          }));
+        }
       }
     );
 

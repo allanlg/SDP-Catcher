@@ -33,6 +33,7 @@ pub struct NetworkInterface {
 #[derive(Serialize, Clone)]
 struct SdpPayload {
     source_ip: String,
+    device_name: String,
     sdp_content: String,
     mac: String,
     manufacturer: String,
@@ -370,6 +371,7 @@ fn start_sniffing(app: AppHandle, selected_interfaces: Vec<NetworkInterface>, st
 
                                                     app_node.emit("sdp-discovered", SdpPayload {
                                                         source_ip: origin_ip,
+                                                        device_name: final_device_name.clone(),
                                                         sdp_content: sdp_content.to_string(),
                                                         mac,
                                                         manufacturer: mfr_enum.to_string(),
