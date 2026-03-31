@@ -9,7 +9,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use manufacturer::identify_manufacturer;
-use pcap::Device;
+
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::Ipv4Packet;
@@ -52,6 +52,8 @@ struct PtpPayload {
 struct DeviceInfo {
     ip: String,
     name: String,
+    #[serde(skip)]
+    last_seen: std::time::Instant,
 }
 
 pub struct AppState {
@@ -61,30 +63,7 @@ pub struct AppState {
     device_timeout_modes: Mutex<HashMap<String, bool>>,
 }
 
-fn get_mac_from_arp(ip: &str) -> (String, String) {
-    let mut cmd = std::process::Command::new("arp");
-    cmd.arg("-a");
-    #[cfg(windows)]
-    cmd.creation_flags(0x08000000);
-    let output = cmd.output();
 
-    if let Ok(out) = output {
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                let entry_ip = parts[0];
-                let entry_mac = parts[1];
-                if entry_ip == ip {
-                    let mac = entry_mac.replace("-", ":").to_uppercase();
-                    let oui = mac.split(':').take(3).collect::<Vec<_>>().join("");
-                    return (mac, oui);
-                }
-            }
-        }
-    }
-    ("Unknown".to_string(), "Unknown".to_string())
-}
 
 #[tauri::command]
 fn get_network_interfaces() -> Vec<NetworkInterface> {
@@ -194,15 +173,20 @@ fn start_sniffing(app: AppHandle, selected_interfaces: Vec<NetworkInterface>, st
                 .open()
                 .expect("Erreur fatale lors de l'ouverture du handle pcap");
 
-            let mut arp_cache: HashMap<String, String> = HashMap::new();
+
             let mut mdns_cooldown: HashMap<String, std::time::Instant> = HashMap::new();
             let mut last_memory_cleanup = std::time::Instant::now();
+            let mut global_mdns_counter = 0;
+            let mut global_mdns_timer = std::time::Instant::now();
 
             while !stop_flag_node.load(Ordering::Relaxed) {
                 if last_memory_cleanup.elapsed().as_secs() > 300 {
                     mdns_cache.clear();
-                    arp_cache.clear();
                     mdns_cooldown.clear();
+                    
+                    let mut table = discovery_node.lock().unwrap();
+                    table.retain(|_, entry| entry.last_seen.elapsed().as_secs() < 900); // 15 minutes TTL
+                    
                     last_memory_cleanup = std::time::Instant::now();
                 }
 
@@ -223,12 +207,24 @@ fn start_sniffing(app: AppHandle, selected_interfaces: Vec<NetworkInterface>, st
 
                             if current_ethertype == EtherTypes::Lldp {
                                 if let Some((mac, name, ip)) = parse_lldp(current_payload) {
-                                    let mut table = discovery_node.lock().unwrap();
-                                    let entry = table.entry(mac.clone()).or_insert(DeviceInfo { ip: ip.clone(), name: name.clone() });
-                                    if entry.ip != ip || entry.name != name {
-                                        entry.ip = ip;
-                                        entry.name = name;
-                                        app_node.emit("discovery-update", (mac, entry.clone())).ok();
+                                    let (key, entry_to_emit) = {
+                                        let mut table = discovery_node.lock().unwrap();
+                                        let entry = table.entry(mac.clone()).or_insert(DeviceInfo { 
+                                            ip: ip.clone(), 
+                                            name: name.clone(),
+                                            last_seen: std::time::Instant::now(),
+                                        });
+                                        entry.last_seen = std::time::Instant::now();
+                                        let mut changed = false;
+                                        if entry.ip != ip || entry.name != name {
+                                            entry.ip = ip;
+                                            entry.name = name;
+                                            changed = true;
+                                        }
+                                        (mac, if changed { Some(entry.clone()) } else { None })
+                                    };
+                                    if let Some(e) = entry_to_emit {
+                                        app_node.emit("discovery-update", (key, e)).ok();
                                     }
                                 }
                             } 
@@ -268,16 +264,9 @@ fn start_sniffing(app: AppHandle, selected_interfaces: Vec<NetworkInterface>, st
 
                                                     let best_name = if !stream_name.is_empty() && stream_name != "---" { stream_name } else { sap_name };
                                                     
-                                                    // 4A. CACHE ARP (Évite de spawner le process system 'arp' 1000 fois par seconde)
-                                                    let mac = if let Some(cached_mac) = arp_cache.get(&origin_ip) {
-                                                        cached_mac.clone()
-                                                    } else {
-                                                        let (resolved_mac, _) = get_mac_from_arp(&origin_ip);
-                                                        arp_cache.insert(origin_ip.clone(), resolved_mac.clone());
-                                                        resolved_mac
-                                                    };
-
-                                                    let key = if mac != "Unknown" { mac.clone() } else { origin_ip.clone() };
+                                                    // 1. Extraction L2 de l'adresse MAC (Suppression de arp -a)
+                                                    let mac = eth.get_source().to_string().to_uppercase();
+                                                    let key = mac.clone();
 
                                                     let mut mfr_enum = if !ptp_id_from_sdp.is_empty() { identify_manufacturer(&ptp_id_from_sdp) } else { manufacturer::Manufacturer::Unknown };
                                                     if mfr_enum == manufacturer::Manufacturer::Unknown { mfr_enum = identify_manufacturer(&mac); }
@@ -296,32 +285,67 @@ fn start_sniffing(app: AppHandle, selected_interfaces: Vec<NetworkInterface>, st
                                                         }
                                                     };
 
-                                                    // 4B. RATE LIMITER mDNS (Empêche l'application de devenir un canon DoS)
+                                                    // 3. Global Rate Limiter mDNS (Token Bucket)
+                                                    if global_mdns_timer.elapsed().as_secs() >= 1 {
+                                                        global_mdns_counter = 0;
+                                                        global_mdns_timer = std::time::Instant::now();
+                                                    }
+
                                                     if is_new && !mdns_cache.contains_key(&origin_ip) {
                                                         let can_send = match mdns_cooldown.get(&origin_ip) {
                                                             Some(last_sent) => last_sent.elapsed().as_secs() > 30, // Cooldown de 30 secondes par IP
                                                             None => true,
                                                         };
 
-                                                        if can_send {
+                                                        if can_send && global_mdns_counter < 5 { // LIMITE GLOBALE : Max 5/sec
                                                             send_mdns_query(&origin_ip, &mdns_sender);
                                                             mdns_cooldown.insert(origin_ip.clone(), std::time::Instant::now());
+                                                            global_mdns_counter += 1;
                                                         }
                                                     }
 
-                                                    {
+                                                    // 2. Anti-Deadlock Tauri (Mutex Drop)
+                                                    let (device_key, entry_to_emit, ptp_info) = {
                                                         let mut table = discovery_node.lock().unwrap();
-                                                        let entry = table.entry(key.clone()).or_insert(DeviceInfo { ip: origin_ip.clone(), name: final_device_name.clone() });
-                                                        if entry.ip != origin_ip || (final_device_name != "---" && entry.name != final_device_name) {
-                                                            entry.ip = origin_ip.clone();
-                                                            if final_device_name != "---" { entry.name = final_device_name.clone(); }
-                                                            app_node.emit("discovery-update", (key.clone(), entry.clone())).ok();
-                                                        }
+                                                        
+                                                        let mut changed = false;
+                                                        let mut cloned_entry = None;
 
-                                                        if !ptp_id_from_sdp.is_empty() {
-                                                            table.insert(ptp_id_from_sdp.clone(), DeviceInfo { ip: origin_ip.clone(), name: final_device_name.clone() });
-                                                            app_node.emit("discovery-update", (ptp_id_from_sdp.clone(), DeviceInfo { ip: origin_ip.clone(), name: final_device_name.clone() })).ok();
-                                                        }
+                                                        {
+                                                            let entry = table.entry(key.clone()).or_insert(DeviceInfo { 
+                                                                ip: origin_ip.clone(), 
+                                                                name: final_device_name.clone(),
+                                                                last_seen: std::time::Instant::now(),
+                                                            });
+                                                            
+                                                            entry.last_seen = std::time::Instant::now();
+                                                            
+                                                            if entry.ip != origin_ip || (final_device_name != "---" && entry.name != final_device_name) {
+                                                                entry.ip = origin_ip.clone();
+                                                                if final_device_name != "---" { entry.name = final_device_name.clone(); }
+                                                                changed = true;
+                                                            }
+                                                            if changed {
+                                                                cloned_entry = Some(entry.clone());
+                                                            }
+                                                        } // entry borrow dropped here
+                                                        
+                                                        let ptp_payload = if !ptp_id_from_sdp.is_empty() {
+                                                            let p_info = DeviceInfo { ip: origin_ip.clone(), name: final_device_name.clone(), last_seen: std::time::Instant::now() };
+                                                            table.insert(ptp_id_from_sdp.clone(), p_info.clone());
+                                                            Some((ptp_id_from_sdp.clone(), p_info))
+                                                        } else {
+                                                            None
+                                                        };
+                                                        
+                                                        (key.clone(), cloned_entry, ptp_payload)
+                                                    };
+
+                                                    if let Some(e) = entry_to_emit {
+                                                        app_node.emit("discovery-update", (device_key, e)).ok();
+                                                    }
+                                                    if let Some((p_id, p_info)) = ptp_info {
+                                                        app_node.emit("discovery-update", (p_id, p_info)).ok();
                                                     }
 
                                                     let use_global = {
@@ -371,15 +395,21 @@ fn start_sniffing(app: AppHandle, selected_interfaces: Vec<NetworkInterface>, st
                                                     for authority in &dns_packet.nameservers { process_record(&authority.name.to_string(), &authority.data); }
 
                                                     if !new_cache_entries.is_empty() {
-                                                        let mut table = discovery_node.lock().unwrap();
-                                                        for (ip_str, clean_name) in new_cache_entries {
-                                                            mdns_cache.insert(ip_str.clone(), clean_name.clone());
-                                                            for (key, entry) in table.iter_mut() {
-                                                                if entry.ip == ip_str && entry.name != clean_name {
-                                                                    entry.name = clean_name.clone();
-                                                                    app_node.emit("discovery-update", (key.clone(), entry.clone())).ok();
+                                                        let mut updates = Vec::new();
+                                                        {
+                                                            let mut table = discovery_node.lock().unwrap();
+                                                            for (ip_str, clean_name) in new_cache_entries {
+                                                                mdns_cache.insert(ip_str.clone(), clean_name.clone());
+                                                                for (key, entry) in table.iter_mut() {
+                                                                    if entry.ip == ip_str && entry.name != clean_name {
+                                                                        entry.name = clean_name.clone();
+                                                                        updates.push((key.clone(), entry.clone()));
+                                                                    }
                                                                 }
                                                             }
+                                                        }
+                                                        for (key, entry) in updates {
+                                                            app_node.emit("discovery-update", (key, entry)).ok();
                                                         }
                                                     }
                                                 }
@@ -445,13 +475,15 @@ fn start_sniffing(app: AppHandle, selected_interfaces: Vec<NetworkInterface>, st
                                     }
                                 }
                             }
-                            let table = discovery_ptp.lock().unwrap();
-                            let (name, final_ip) = if let Some(info) = table.get(&ptp_id) {
-                                (info.name.clone(), info.ip.clone())
-                            } else if let Some(info) = table.get(&source_ip) {
-                                (info.name.clone(), info.ip.clone())
-                            } else {
-                                ("---".to_string(), source_ip.clone())
+                            let (name, final_ip) = {
+                                let table = discovery_ptp.lock().unwrap();
+                                if let Some(info) = table.get(&ptp_id) {
+                                    (info.name.clone(), info.ip.clone())
+                                } else if let Some(info) = table.get(&source_ip) {
+                                    (info.name.clone(), info.ip.clone())
+                                } else {
+                                    ("---".to_string(), source_ip.clone())
+                                }
                             };
                             app_ptp.emit("ptp-clock-update", PtpPayload { ptp_id, name, ip: final_ip, interface_ip: matched_interface, domain }).ok();
                         }
@@ -485,7 +517,11 @@ fn get_arp_table(state: State<'_, AppState>) -> HashMap<String, DeviceInfo> {
                 let ip = parts[0];
                 let mac = parts[1].replace("-", ":").to_uppercase();
                 if mac.split(':').count() == 6 {
-                    table.entry(mac).or_insert(DeviceInfo { ip: ip.to_string(), name: "---".to_string() });
+                    table.entry(mac).or_insert(DeviceInfo { 
+                        ip: ip.to_string(), 
+                        name: "---".to_string(), 
+                        last_seen: std::time::Instant::now() 
+                    });
                 }
             }
         }
@@ -573,7 +609,7 @@ fn parse_lldp(packet: &[u8]) -> Option<(String, String, String)> {
         let tlv_type = (header >> 9) as u8;
         let tlv_len = (header & 0x01FF) as usize;
         pos += 2;
-        if pos + tlv_len > packet.len() { break; }
+        if tlv_len == 0 || pos + tlv_len > packet.len() { break; } // Empêche les boucles infinies sur TLV=0
         let value = &packet[pos..pos + tlv_len];
         match tlv_type {
             1 => { if tlv_len >= 7 && value[0] == 4 { chassis_id = value[1..7].iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(":"); } }
