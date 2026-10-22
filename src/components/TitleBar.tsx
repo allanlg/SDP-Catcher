@@ -31,7 +31,7 @@ export function TitleBar() {
       <div data-tauri-drag-region className="absolute inset-0 z-0 bg-transparent" onDoubleClick={() => appWindow.toggleMaximize()} />
 
       <div className="flex items-center gap-2.5 pointer-events-none relative z-20">
-        <img src="/app-icon.png" className="w-6 h-6 object-contain" alt="SDP Catcher Logo" />
+        <img src="/app-icon.png" className="w-5 h-5 object-contain" alt="SDP Catcher Logo" />
         <span className="text-[0.6875rem] font-bold text-zinc-500 tracking-[0.12em] uppercase">SDP Catcher</span>
         <span className="text-xs text-white/40 font-mono tracking-wider">v1.0.2</span>
       </div>

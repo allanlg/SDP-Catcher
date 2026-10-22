@@ -1,6 +1,6 @@
 [package]
 name = "sdp-catcher"
-version = "1.0.1"
+version = "1.0.2"
 description = "A Tauri App"
 authors = ["Allan Le Guyader"]
 edition = "2021"
@@ -13,6 +13,12 @@ edition = "2021"
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "sdp_catcher_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "sdp-catcher"
+path = "src/main.rs"
+test = false
+bench = false
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -33,4 +39,4 @@ tauri-plugin-window-state = "2"
 pcap = "1.3.0"
 dns-parser = "0.8.0"
 simple-dns = "0.7.0"
-
+flate2 = "1"

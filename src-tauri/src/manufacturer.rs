@@ -1,5 +1,7 @@
 use serde::Serialize;
+use std::fmt;
 
+#[allow(clippy::upper_case_acronyms, dead_code)]
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub enum Manufacturer {
     Riedel,
@@ -46,54 +48,57 @@ pub enum Manufacturer {
     Unknown,
 }
 
-impl Manufacturer {
-    pub fn to_string(&self) -> String {
-        match self {
-            Manufacturer::Riedel => "Riedel".to_string(),
-            Manufacturer::Audinate => "Audinate".to_string(),
-            Manufacturer::Yamaha => "Yamaha".to_string(),
-            Manufacturer::Lawo => "Lawo".to_string(),
-            Manufacturer::Merging => "Merging".to_string(),
-            Manufacturer::SSL => "SSL".to_string(),
-            Manufacturer::AllenHeath => "Allen & Heath".to_string(),
-            Manufacturer::Avid => "Avid".to_string(),
-            Manufacturer::Shure => "Shure".to_string(),
-            Manufacturer::Sennheiser => "Sennheiser".to_string(),
-            Manufacturer::AudioTechnica => "Audio-Technica".to_string(),
-            Manufacturer::BlackmagicDesign => "Blackmagic Design".to_string(),
-            Manufacturer::Focusrite => "Focusrite".to_string(),
-            Manufacturer::Genelec => "Genelec".to_string(),
-            Manufacturer::Neumann => "Neumann".to_string(),
-            Manufacturer::Apogee => "Apogee".to_string(),
-            Manufacturer::Luminex => "Luminex".to_string(),
-            Manufacturer::NetgearAV => "Netgear AV".to_string(),
-            Manufacturer::DBAudiotechnik => "d&b audiotechnik".to_string(),
-            Manufacturer::LAco => "L'Acoustics".to_string(),
-            Manufacturer::MeyerSound => "Meyer Sound".to_string(),
-            Manufacturer::DirectOut => "DirectOut".to_string(),
-            Manufacturer::Digico => "Digico".to_string(),
-            Manufacturer::QSC => "QSC".to_string(),
-            Manufacturer::AxiaTelos => "Axia/Telos".to_string(),
-            Manufacturer::Wheatstone => "Wheatstone".to_string(),
-            Manufacturer::RossVideo => "Ross Video".to_string(),
-            Manufacturer::Evertz => "Evertz".to_string(),
-            Manufacturer::GrassValley => "Grass Valley".to_string(),
-            Manufacturer::TSL => "TSL".to_string(),
-            Manufacturer::Calrec => "Calrec".to_string(),
-            Manufacturer::ClearCom => "Clear-Com".to_string(),
-            Manufacturer::RTS => "RTS".to_string(),
-            Manufacturer::BirdDog => "BirdDog".to_string(),
-            Manufacturer::Studer => "Studer".to_string(),
-            Manufacturer::Sonifex => "Sonifex".to_string(),
-            Manufacturer::BehringerMidas => "Behringer/Midas".to_string(),
-            Manufacturer::SoundDevices => "Sound Devices".to_string(),
-            Manufacturer::KlarkTeknik => "Klark Teknik".to_string(),
-            Manufacturer::Kramer => "Kramer".to_string(),
-            Manufacturer::ATEN => "ATEN".to_string(),
-            Manufacturer::Unknown => "Unknown".to_string(),
-        }
+impl fmt::Display for Manufacturer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Manufacturer::Riedel => "Riedel",
+            Manufacturer::Audinate => "Audinate",
+            Manufacturer::Yamaha => "Yamaha",
+            Manufacturer::Lawo => "Lawo",
+            Manufacturer::Merging => "Merging",
+            Manufacturer::SSL => "SSL",
+            Manufacturer::AllenHeath => "Allen & Heath",
+            Manufacturer::Avid => "Avid",
+            Manufacturer::Shure => "Shure",
+            Manufacturer::Sennheiser => "Sennheiser",
+            Manufacturer::AudioTechnica => "Audio-Technica",
+            Manufacturer::BlackmagicDesign => "Blackmagic Design",
+            Manufacturer::Focusrite => "Focusrite",
+            Manufacturer::Genelec => "Genelec",
+            Manufacturer::Neumann => "Neumann",
+            Manufacturer::Apogee => "Apogee",
+            Manufacturer::Luminex => "Luminex",
+            Manufacturer::NetgearAV => "Netgear AV",
+            Manufacturer::DBAudiotechnik => "d&b audiotechnik",
+            Manufacturer::LAco => "L'Acoustics",
+            Manufacturer::MeyerSound => "Meyer Sound",
+            Manufacturer::DirectOut => "DirectOut",
+            Manufacturer::Digico => "Digico",
+            Manufacturer::QSC => "QSC",
+            Manufacturer::AxiaTelos => "Axia/Telos",
+            Manufacturer::Wheatstone => "Wheatstone",
+            Manufacturer::RossVideo => "Ross Video",
+            Manufacturer::Evertz => "Evertz",
+            Manufacturer::GrassValley => "Grass Valley",
+            Manufacturer::TSL => "TSL",
+            Manufacturer::Calrec => "Calrec",
+            Manufacturer::ClearCom => "Clear-Com",
+            Manufacturer::RTS => "RTS",
+            Manufacturer::BirdDog => "BirdDog",
+            Manufacturer::Studer => "Studer",
+            Manufacturer::Sonifex => "Sonifex",
+            Manufacturer::BehringerMidas => "Behringer/Midas",
+            Manufacturer::SoundDevices => "Sound Devices",
+            Manufacturer::KlarkTeknik => "Klark Teknik",
+            Manufacturer::Kramer => "Kramer",
+            Manufacturer::ATEN => "ATEN",
+            Manufacturer::Unknown => "Unknown",
+        };
+        formatter.write_str(name)
     }
+}
 
+impl Manufacturer {
     pub fn default_timeout_ms(&self, unknown_timeout_s: u64) -> u64 {
         match self {
             Manufacturer::Riedel => 12_000,
@@ -143,9 +148,11 @@ impl Manufacturer {
 }
 
 pub fn identify_manufacturer(id: &str) -> Manufacturer {
-    let clean_id = id
-        .replace(|c: char| !c.is_alphanumeric(), "")
-        .to_uppercase();
+    let clean_id: String = id
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .map(|character| character.to_ascii_uppercase())
+        .collect();
     if clean_id.len() < 6 {
         return Manufacturer::Unknown;
     }

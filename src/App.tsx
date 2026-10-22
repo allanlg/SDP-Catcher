@@ -27,16 +27,21 @@ export interface Device {
   manufacturer: string;
   sapTimeoutMs: number;
   streams: Stream[];
+  interfaceIp: string;
   isGhost?: boolean;
 }
 
 interface SdpDiscoveredEvent {
   source_ip: string;
+  network_source_ip: string;
   device_name: string;
   sdp_content: string;
+  session_id: string;
+  is_delete: boolean;
   mac: string;
   manufacturer: string;
   sap_timeout_ms: number;
+  interface_ip: string;
 }
 
 export interface InterfaceInfo {
@@ -45,12 +50,22 @@ export interface InterfaceInfo {
   mask: string;
 }
 
+interface StartSniffingReport {
+  started_interfaces: string[];
+  failed_interfaces: string[];
+  sap_groups: string[];
+  ptp_active: boolean;
+}
+
+const MAX_CACHED_STREAMS = 4096;
+const MAX_OFFLINE_RETENTION_MS = 15 * 60 * 1000;
 
 function App() {
   const [activeIp, setActiveIp] = useState<string | null>(null);
   const activeIpRef = useRef(activeIp);
   const [zoomLevel, setZoomLevel] = useState<number>(1.0);
   const [copyToast, setCopyToast] = useState<{ x: number, y: number, visible: boolean } | null>(null);
+  const sniffingTransitionRef = useRef(false);
 
   useEffect(() => {
     let timeout: any;
@@ -99,6 +114,7 @@ function App() {
     return () => window.removeEventListener('keydown', handleZoomKeys);
   }, []);
   const [isSniffing, setIsSniffing] = useState(false);
+  const [sniffingWarning, setSniffingWarning] = useState<string | null>(null);
   const [interfaces, setInterfaces] = useState<InterfaceInfo[]>([]);
   const [devices, setDevices] = useState<Device[]>([]);
   const [selectedStream, setSelectedStream] = useState<Stream | null>(null);
@@ -113,6 +129,17 @@ function App() {
 
   const [selectedDomain, setSelectedDomain] = useState(0);
   const selectedDomainRef = useRef(selectedDomain);
+
+  useEffect(() => {
+    setSelectedStream((selected) => {
+      if (!selected) return null;
+      const current = devices
+        .flatMap((device) => device.streams)
+        .find((stream) => stream.id === selected.id);
+      if (!current) return null;
+      return current.lastSeen === selected.lastSeen ? selected : current;
+    });
+  }, [devices]);
 
   useEffect(() => {
     selectedDomainRef.current = selectedDomain;
@@ -130,11 +157,10 @@ function App() {
     setSapTimeoutDraft(unknownTimeout.toString());
   }, [unknownTimeout]);
 
-  const parseSdp = (raw: string): { name: string; multicastIp: string; originIp: string; sessionInfo: string | null } => {
+  const parseSdp = (raw: string): { name: string; multicastIp: string; sessionInfo: string | null } => {
     const lines = raw.split(/\r?\n/);
     let name = "Unknown Stream";
     let multicastIp = "0.0.0.0";
-    let originIp = "0.0.0.0";
     let sessionInfo: string | null = null;
 
     for (const line of lines) {
@@ -145,14 +171,9 @@ function App() {
       } else if (line.startsWith("c=IN IP4 ")) {
         const parts = line.substring(9).split("/");
         multicastIp = parts[0].trim();
-      } else if (line.startsWith("o=")) {
-        const parts = line.split(" ");
-        if (parts.length >= 6) {
-          originIp = parts[5].trim();
-        }
       }
     }
-    return { name, multicastIp, originIp, sessionInfo };
+    return { name, multicastIp, sessionInfo };
   };
 
   const refreshInterfaces = async () => {
@@ -179,15 +200,31 @@ function App() {
       const cache = localStorage.getItem('sdp_ghost_cache');
       if (cache) {
         try {
-          const parsed = JSON.parse(cache) as Device[];
-          const ghosted = parsed.map(d => ({
-            ...d,
-            isGhost: true,
-            streams: d.streams.map(s => ({ ...s, isGhost: true }))
-          }));
+          const parsed = JSON.parse(cache) as unknown;
+          if (!Array.isArray(parsed)) throw new Error("Invalid cache shape");
+          let retainedStreams = 0;
+          const ghosted: Device[] = [];
+          for (const device of parsed as Device[]) {
+            if (retainedStreams >= MAX_CACHED_STREAMS) break;
+            const streams = Array.isArray(device.streams)
+              ? device.streams
+                  .slice(0, MAX_CACHED_STREAMS - retainedStreams)
+                  .map((stream) => ({ ...stream, isGhost: true }))
+              : [];
+            retainedStreams += streams.length;
+            if (streams.length > 0) {
+              ghosted.push({
+                ...device,
+                interfaceIp: device.interfaceIp || savedIp || "",
+                isGhost: true,
+                streams,
+              });
+            }
+          }
           setDevices(ghosted);
         } catch (e) {
           console.error("Ghost cache corrupted:", e);
+          localStorage.removeItem('sdp_ghost_cache');
         }
       }
     };
@@ -205,21 +242,45 @@ function App() {
   useEffect(() => {
     if (devices.length > 0) {
       const timer = setTimeout(() => {
-        localStorage.setItem('sdp_ghost_cache', JSON.stringify(devices));
+        try {
+          localStorage.setItem('sdp_ghost_cache', JSON.stringify(devices));
+        } catch (error) {
+          console.error("Unable to persist the SDP cache:", error);
+          localStorage.removeItem('sdp_ghost_cache');
+        }
       }, 1000);
       return () => clearTimeout(timer);
+    } else {
+      localStorage.removeItem('sdp_ghost_cache');
     }
   }, [devices]);
 
   // Global Sniffing Management
   const startGlobalSniffing = async (ifaces: InterfaceInfo[]) => {
-    if (ifaces.length === 0) return;
+    if (ifaces.length === 0 || sniffingTransitionRef.current) return;
+    sniffingTransitionRef.current = true;
     try {
-      await invoke("start_sniffing", { selectedInterfaces: ifaces });
-      setIsSniffing(true);
+      const report = await invoke<StartSniffingReport>("start_sniffing", {
+        selectedInterfaces: ifaces,
+      });
+      if (report.failed_interfaces.length > 0) {
+        console.warn("Some interfaces could not be opened:", report.failed_interfaces);
+        setSniffingWarning(report.failed_interfaces.join(" • "));
+      } else if (!report.ptp_active) {
+        setSniffingWarning("Capture SAP active, écoute PTP indisponible");
+      } else {
+        setSniffingWarning(null);
+      }
+      if (!report.ptp_active) {
+        console.warn("SAP capture is active, but the PTP listener is unavailable.");
+      }
+      setIsSniffing(report.started_interfaces.length > 0);
     } catch (err) {
       console.error("Failed to start global sniffing", err);
+      setSniffingWarning(String(err));
       setIsSniffing(false);
+    } finally {
+      sniffingTransitionRef.current = false;
     }
   };
 
@@ -231,27 +292,60 @@ function App() {
 
   useEffect(() => {
     const unlistenSdp = listen<SdpDiscoveredEvent>("sdp-discovered", (event) => {
-      const { sdp_content, mac, manufacturer, sap_timeout_ms, device_name } = event.payload;
-      const { name, multicastIp, originIp, sessionInfo } = parseSdp(sdp_content);
-
-      if (originIp === "0.0.0.0") return;
+      const {
+        source_ip,
+        sdp_content,
+        session_id,
+        is_delete,
+        mac,
+        manufacturer,
+        sap_timeout_ms,
+        device_name,
+        interface_ip,
+      } = event.payload;
+      const streamId = `${interface_ip}|${session_id}`;
 
       setDevices((prev) => {
+        if (is_delete) {
+          return prev
+            .map((device) => ({
+              ...device,
+              streams: device.streams.filter((stream) => stream.id !== streamId),
+            }))
+            .filter((device) => device.streams.length > 0);
+        }
+
+        const { name, multicastIp, sessionInfo } = parseSdp(sdp_content);
         const timestamp = Date.now();
-        const existingDeviceIndex = prev.findIndex((d) => d.ip === originIp);
-        const deviceName = (device_name && device_name !== "---") ? device_name : (sessionInfo || `Device ${originIp}`);
+        const existingDeviceIndex = prev.findIndex(
+          (device) => device.ip === source_ip && device.interfaceIp === interface_ip,
+        );
+        const deviceName =
+          device_name && device_name !== "---"
+            ? device_name
+            : sessionInfo || `Device ${source_ip}`;
+        const totalStreams = prev.reduce(
+          (count, device) => count + device.streams.length,
+          0,
+        );
 
         if (existingDeviceIndex >= 0) {
           const newDevices = [...prev];
-          const device = { ...newDevices[existingDeviceIndex] };
-          
+          const device = {
+            ...newDevices[existingDeviceIndex],
+            streams: [...newDevices[existingDeviceIndex].streams],
+          };
+
           device.name = deviceName;
           device.mac = mac;
           device.manufacturer = manufacturer;
           device.sapTimeoutMs = sap_timeout_ms;
-          device.isGhost = false; // Transition to real
+          device.interfaceIp = interface_ip;
+          device.isGhost = false;
 
-          const existingStreamIndex = device.streams.findIndex((s) => s.name === name);
+          const existingStreamIndex = device.streams.findIndex(
+            (stream) => stream.id === streamId,
+          );
 
           if (existingStreamIndex >= 0) {
             device.streams[existingStreamIndex] = {
@@ -262,11 +356,12 @@ function App() {
               mac,
               manufacturer,
               sapTimeoutMs: sap_timeout_ms,
-              isGhost: false, // Transition to real
+              isGhost: false,
             };
           } else {
+            if (totalStreams >= MAX_CACHED_STREAMS) return prev;
             device.streams.push({
-              id: `${originIp}-${name}`,
+              id: streamId,
               name,
               multicastIp,
               sdpContent: sdp_content,
@@ -274,24 +369,26 @@ function App() {
               mac,
               manufacturer,
               sapTimeoutMs: sap_timeout_ms,
-              isGhost: false, // Transition to real
+              isGhost: false,
             });
           }
           newDevices[existingDeviceIndex] = device;
           return newDevices;
         } else {
+          if (totalStreams >= MAX_CACHED_STREAMS) return prev;
           return [
             ...prev,
             {
               name: deviceName,
-              ip: originIp,
+              ip: source_ip,
               mac,
               manufacturer,
               sapTimeoutMs: sap_timeout_ms,
+              interfaceIp: interface_ip,
               isGhost: false,
               streams: [
                 {
-                  id: `${originIp}-${name}`,
+                  id: streamId,
                   name,
                   multicastIp,
                   sdpContent: sdp_content,
@@ -326,6 +423,11 @@ function App() {
       }
     );
 
+    const unlistenSnifferError = listen<string>("sniffer-error", (event) => {
+      console.error(event.payload);
+      setSniffingWarning(event.payload);
+    });
+
     const unlistenPtp = listen<{ptp_id: string, name: string, ip: string, interface_ip: string, domain: number}>("ptp-clock-update", (event) => {
       const { ptp_id, interface_ip, domain } = event.payload;
       console.log("PTP Packet Received - Domain:", domain, "Target:", selectedDomainRef.current);
@@ -354,6 +456,7 @@ function App() {
     return () => {
       unlistenSdp.then(f => (f as () => void)());
       unlistenDiscovery.then(f => (f as () => void)());
+      unlistenSnifferError.then(f => (f as () => void)());
       unlistenPtp.then(f => (f as () => void)());
     };
   }, []);
@@ -414,8 +517,22 @@ function App() {
 
   useEffect(() => {
     const interval = setInterval(() => {
-      setDevices(prev => [...prev]);
-    }, 2000);
+      const now = Date.now();
+      setDevices((previous) =>
+        previous
+          .map((device) => ({
+            ...device,
+            streams: device.streams.filter((stream) => {
+              const retention = Math.max(
+                MAX_OFFLINE_RETENTION_MS,
+                stream.sapTimeoutMs * 10,
+              );
+              return now - stream.lastSeen <= retention;
+            }),
+          }))
+          .filter((device) => device.streams.length > 0),
+      );
+    }, 5000);
     return () => clearInterval(interval);
   }, []);
 
@@ -451,7 +568,10 @@ function App() {
   // Le filtrage par masque de sous-réseau a été retiré pour permettre 
   // la visibilité des équipements hors-réseau (ex: APIPA).
   // L'affichage de tous les streams capturés est forcé.
-  const filteredDevices = devices;
+  // Filtrage absolu basé sur l'interface physique de capture pcap (supporte l'APIPA hors-subnet)
+  const filteredDevices = activeIp
+    ? devices.filter(d => d.interfaceIp === activeIp)
+    : devices;
 
 
   // Disable Context Menu Globally
@@ -530,6 +650,14 @@ function App() {
               {isPtpActive ? getFooterGmcText() : (activeIp ? "No PTP data for this PTP Domain" : "Select Interface")}
             </span>
           </div>
+          {sniffingWarning && (
+            <span
+              className="max-w-80 truncate text-[0.5625rem] font-semibold text-red-400"
+              title={sniffingWarning}
+            >
+              CAPTURE: {sniffingWarning}
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-4 ml-auto">
